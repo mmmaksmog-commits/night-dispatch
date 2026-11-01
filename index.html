@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Ночной диспетчер — игра</title>
+  <meta name="description" content="Ночная смена диспетчера такси: распределяйте машины по вызовам, объезжайте пробки и не теряйте клиентов.">
+  <meta name="theme-color" content="#0b0d1a">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚕</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;700;800&family=JetBrains+Mono:wght@600;800&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg: #0b0d1a; --panel: #141832; --line: #262c55; --text: #e9ecff; --muted: #8c93c4; --taxi: #ffd23f; --ok: #5ef2a0; --bad: #ff5a6e; --jam: #ff4d4d; color-scheme: dark; }
+    html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; margin: 0; overflow: hidden; }
+    body { display: flex; flex-direction: column; background: var(--bg); color: var(--text); font: 15px/1.4 Onest, system-ui, sans-serif; user-select: none; -webkit-user-select: none; }
+    .hud { display: flex; align-items: center; gap: 16px; padding: calc(10px + env(safe-area-inset-top)) 16px 10px; font: 800 15px 'JetBrains Mono', monospace; }
+    .hud .clock { color: var(--taxi); font-size: 20px; }
+    .hud .money { margin-left: auto; color: var(--ok); }
+    .hud .rate { color: var(--taxi); letter-spacing: 1px; }
+    canvas { flex: 1; min-height: 0; width: 100%; display: block; touch-action: none; }
+    .panel { min-height: 76px; display: flex; align-items: center; gap: 12px; padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--panel); }
+    .panel p { margin: 0; flex: 1; color: var(--muted); font-size: 14px; }
+    .panel p b { color: var(--text); }
+    .panel button { flex: none; padding: 12px 16px; border: 0; border-radius: 12px; background: var(--taxi); color: #1b1600; font: 800 15px Onest, sans-serif; cursor: pointer; }
+    .panel button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+    .ov { position: fixed; inset: 0; z-index: 5; display: grid; place-items: center; padding: 20px; background: rgba(5, 6, 14, 0.85); backdrop-filter: blur(4px); }
+    .ov[hidden] { display: none; }
+    .card { width: min(460px, 100%); max-height: 100%; overflow: auto; padding: 26px 22px; border: 1px solid var(--line); border-radius: 24px; background: var(--panel); text-align: center; }
+    .card h1 { margin: 0; font: 800 clamp(30px, 8vw, 40px)/1.1 Onest, sans-serif; }
+    .card h1 span { color: var(--taxi); }
+    .card p { color: var(--muted); }
+    .card ul { margin: 16px 0; padding: 0; list-style: none; display: grid; gap: 10px; text-align: left; }
+    .card li { display: grid; grid-template-columns: 30px 1fr; gap: 8px; }
+    .card .go { width: 100%; margin-top: 8px; padding: 15px; border: 0; border-radius: 14px; background: var(--taxi); color: #1b1600; font: 800 17px Onest, sans-serif; cursor: pointer; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 16px 0; }
+    .stats div { padding: 12px 6px; border-radius: 14px; background: #0f1228; font-size: 13px; color: var(--muted); }
+    .stats b { display: block; font: 800 22px 'JetBrains Mono', monospace; color: var(--text); }
+    .back { display: inline-block; margin-top: 14px; color: var(--muted); font-size: 13px; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="hud"><span class="clock" id="clock">22:00</span><span class="rate" id="rate">★★★★★</span><span class="money" id="money">0 ₽</span></div>
+  <canvas id="cv"></canvas>
+  <div class="panel" id="panel"><p>Нажмите на вызов 🙋, затем на машину.</p></div>
+  <div class="ov" id="ov"><div class="card" id="card"></div></div>
+<script>
+(() => {
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  const $ = (id) => document.getElementById(id);
+  const SHIFT = 200;          // секунд реального времени на смену 22:00–06:00
+  const PATIENCE = 32;        // сколько клиент ждёт машину
+  const SPEED = 1.9;          // перекрёстков в секунду по свободной улице
+  const NAMES = ['Ашот', 'Ира', 'Тимур', 'Рустам', 'Света'];
+  const COLORS = ['#ffd23f', '#5ef2a0', '#5ab8ff', '#ff8af0', '#ff9f43'];
+  const PEOPLE = ['🙋', '🙋‍♂️', '🧑‍💼', '💃', '🧳', '🧑‍🎓', '👩‍⚕️', '🕺'];
+  let C = 6, R = 9, cell = 50, ox = 0, oy = 0, dpr = 1;
+  let G = null, running = false, selected = null, last = 0, floats = [];
+  let best = 0;
+  try { best = +localStorage.getItem('dispatch-best') || 0; } catch {}
+
+  const idx = (x, y) => y * (C + 1) + x;
+  const xy = (i) => [i % (C + 1), Math.floor(i / (C + 1))];
+  const ek = (a, b) => (a < b ? `${a}-${b}` : `${b}-${a}`);
+  const fmt = (v) => `${Math.round(v).toLocaleString('ru-RU')} ₽`;
+
+  function layout() {
+    const r = cv.getBoundingClientRect(); dpr = Math.min(devicePixelRatio || 1, 2);
+    cv.width = r.width * dpr; cv.height = r.height * dpr;
+    if (!G) { const wide = r.width > r.height; C = wide ? 9 : 5; R = wide ? 5 : 8; }
+    cell = Math.min((cv.width - 40 * dpr) / C, (cv.height - 40 * dpr) / R);
+    ox = (cv.width - cell * C) / 2; oy = (cv.height - cell * R) / 2;
+  }
+  addEventListener('resize', layout);
+  const px = (gx) => ox + gx * cell, py = (gy) => oy + gy * cell;
+
+  function neighbors(i) {
+    const [x, y] = xy(i), out = [];
+    if (x > 0) out.push(idx(x - 1, y)); if (x < C) out.push(idx(x + 1, y));
+    if (y > 0) out.push(idx(x, y - 1)); if (y < R) out.push(idx(x, y + 1));
+    return out;
+  }
+  const weight = (a, b) => (G.jams.has(ek(a, b)) ? 3.2 : 1);
+  // Дейкстра по сетке улиц с учётом пробок
+  function route(from, to) {
+    const N = (C + 1) * (R + 1), dist = new Float64Array(N).fill(Infinity), prev = new Int32Array(N).fill(-1), done = new Uint8Array(N);
+    dist[from] = 0;
+    for (;;) {
+      let u = -1;
+      for (let i = 0; i < N; i++) if (!done[i] && (u < 0 || dist[i] < dist[u])) u = i;
+      if (u < 0 || dist[u] === Infinity || u === to) break;
+      done[u] = 1;
+      for (const v of neighbors(u)) { const d = dist[u] + weight(u, v); if (d < dist[v]) { dist[v] = d; prev[v] = u; } }
+    }
+    const path = []; for (let v = to; v !== from && v >= 0; v = prev[v]) path.unshift(v);
+    return { path, cost: dist[to] };
+  }
+
+  function newGame() {
+    layout();
+    const N = (C + 1) * (R + 1);
+    // окна в домах: случайные огоньки
+    const windows = [];
+    for (let y = 0; y < R; y++) for (let x = 0; x < C; x++) for (let k = 0; k < 6; k++) windows.push([x + 0.2 + Math.random() * 0.6, y + 0.2 + Math.random() * 0.6, Math.random()]);
+    G = {
+      t: 0, money: 0, rating: 5, served: 0, lost: 0, calls: [], jams: new Set(), jamUntil: 0, nextCall: 2, windows,
+      cars: [0, 1, 2].map((i) => makeCar(i, Math.floor(Math.random() * N))),
+    };
+    selected = null; floats = [];
+    $('ov').hidden = true; running = true; last = performance.now(); panel();
+  }
+  function makeCar(i, node) { const [x, y] = xy(node); return { id: i, name: NAMES[i], color: COLORS[i], node, x, y, path: [], task: null }; }
+
+  function spawnCall() {
+    const N = (C + 1) * (R + 1);
+    let from, to, tries = 0;
+    do {
+      from = Math.floor(Math.random() * N); to = Math.floor(Math.random() * N); tries++;
+      const [a, b] = xy(from), [c, d] = xy(to);
+      if (Math.abs(a - c) + Math.abs(b - d) >= 3 && !G.calls.some((k) => k.from === from)) break;
+    } while (tries < 50);
+    const [a, b] = xy(from), [c, d] = xy(to);
+    const dist = Math.abs(a - c) + Math.abs(b - d);
+    G.calls.push({ from, to, born: G.t, state: 'wait', car: null, fare: 120 + dist * 45, who: PEOPLE[Math.random() * PEOPLE.length | 0], tip: 0 });
+    if (!selected) panel();
+  }
+
+  function assign(call, car) {
+    if (car.task && car.task.stage === 'drop') return;
+    if (car.task) { car.task.call.state = 'wait'; car.task.call.car = null; }
+    if (call.car && call.car !== car) call.car.task = null, call.car.path = [];
+    call.state = 'assigned'; call.car = car;
+    car.task = { call, stage: 'pickup' };
+    car.path = route(car.node, call.from).path;
+    if (!car.path.length) arrive(car);
+    selected = null; panel();
+  }
+  function eta(car, call) { return Math.round(route(car.node, call.from).cost / SPEED); }
+
+  function arrive(car) {
+    const t = car.task; if (!t) return;
+    if (t.stage === 'pickup') {
+      const waited = G.t - t.call.born;
+      t.call.tip = waited < 12 ? Math.round(t.call.fare * 0.3) : 0;
+      t.call.state = 'ride'; t.stage = 'drop';
+      car.path = route(car.node, t.call.to).path;
+      if (!car.path.length) arrive(car);
+    } else {
+      const sum = t.call.fare + t.call.tip;
+      G.money += sum; G.served++;
+      floats.push({ x: car.x, y: car.y, text: `+${sum} ₽${t.call.tip ? ' 🤑' : ''}`, t: 0, color: '#5ef2a0' });
+      G.calls = G.calls.filter((c) => c !== t.call);
+      car.task = null;
+    }
+    panel();
+  }
+
+  function update(dt) {
+    G.t += dt;
+    // пик вызовов около двух ночи, когда закрываются бары
+    const phase = G.t / SHIFT;
+    const interval = 6.5 - 3.6 * Math.exp(-((phase - 0.45) ** 2) / 0.035);
+    G.nextCall -= dt;
+    if (G.nextCall <= 0) { spawnCall(); G.nextCall = interval * (0.7 + Math.random() * 0.6); }
+    // в час ночи выходит четвёртая машина
+    if (phase > 0.375 && G.cars.length === 3) { G.cars.push(makeCar(3, idx(Math.floor(C / 2), Math.floor(R / 2)))); floats.push({ x: C / 2, y: R / 2, text: '🚕 Рустам вышел на смену', t: 0, color: '#ff8af0' }); }
+    // пробки и ремонты меняются
+    if (G.t > G.jamUntil) {
+      G.jams.clear();
+      const N = (C + 1) * (R + 1);
+      for (let k = 0; k < 6 + Math.round(phase * 6); k++) { const a = Math.floor(Math.random() * N), nb = neighbors(a); G.jams.add(ek(a, nb[Math.random() * nb.length | 0])); }
+      G.jamUntil = G.t + 25;
+    }
+    for (const car of G.cars) {
+      let move = dt * SPEED;
+      while (move > 0 && car.path.length) {
+        const target = car.path[0], [tx, ty] = xy(target);
+        const w = weight(car.node, target);
+        const d = Math.hypot(tx - car.x, ty - car.y);
+        const step = move / w;
+        if (step >= d) { car.x = tx; car.y = ty; car.node = target; car.path.shift(); move -= d * w; if (!car.path.length) arrive(car); }
+        else { car.x += (tx - car.x) / d * step; car.y += (ty - car.y) / d * step; move = 0; }
+      }
+    }
+    for (const call of [...G.calls]) {
+      if (call.state !== 'ride' && G.t - call.born > PATIENCE) {
+        G.calls = G.calls.filter((c) => c !== call); G.lost++; G.rating = Math.max(0, G.rating - 0.5);
+        if (call.car) { call.car.task = null; call.car.path = []; }
+        if (selected === call) selected = null;
+        const [x, y] = xy(call.from);
+        floats.push({ x, y, text: 'Клиент ушёл 😤', t: 0, color: '#ff5a6e' });
+        panel();
+      }
+    }
+    floats.forEach((f) => (f.t += dt)); floats = floats.filter((f) => f.t < 1.8);
+    const mins = Math.floor(phase * 480), h = (22 + Math.floor(mins / 60)) % 24;
+    $('clock').textContent = `${String(h).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
+    $('money').textContent = fmt(G.money);
+    $('rate').textContent = '★'.repeat(Math.round(G.rating)) + '☆'.repeat(5 - Math.round(G.rating));
+    if (G.rating <= 2.5) end(false); else if (G.t >= SHIFT) end(true);
+  }
+
+  function draw(now) {
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(0, 0, cv.width, cv.height);
+    if (!G) return;
+    const pad = cell * 0.12;
+    // кварталы и окна
+    for (let y = 0; y < R; y++) for (let x = 0; x < C; x++) {
+      ctx.fillStyle = '#151a36';
+      ctx.beginPath(); ctx.roundRect(px(x) + pad, py(y) + pad, cell - pad * 2, cell - pad * 2, cell * 0.1); ctx.fill();
+    }
+    for (const [wx, wy, k] of G.windows) {
+      const on = Math.sin(now / 2000 + k * 40) > -0.3;
+      if (!on) continue;
+      ctx.fillStyle = k > 0.8 ? 'rgba(255,210,63,.55)' : 'rgba(120,140,255,.25)';
+      ctx.fillRect(px(wx), py(wy), cell * 0.06, cell * 0.08);
+    }
+    // улицы
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#262c55'; ctx.lineWidth = cell * 0.16;
+    for (let y = 0; y <= R; y++) { ctx.beginPath(); ctx.moveTo(px(0), py(y)); ctx.lineTo(px(C), py(y)); ctx.stroke(); }
+    for (let x = 0; x <= C; x++) { ctx.beginPath(); ctx.moveTo(px(x), py(0)); ctx.lineTo(px(x), py(R)); ctx.stroke(); }
+    // пробки
+    ctx.strokeStyle = 'rgba(255,77,77,.75)'; ctx.lineWidth = cell * 0.1;
+    for (const k of G.jams) {
+      const [a, b] = k.split('-').map(Number), [ax, ay] = xy(a), [bx, by] = xy(b);
+      ctx.setLineDash([cell * 0.08, cell * 0.1]); ctx.beginPath(); ctx.moveTo(px(ax), py(ay)); ctx.lineTo(px(bx), py(by)); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    // маршруты машин
+    for (const car of G.cars) {
+      if (!car.path.length) continue;
+      ctx.strokeStyle = car.color + '88'; ctx.lineWidth = cell * 0.05; ctx.setLineDash([cell * 0.05, cell * 0.08]);
+      ctx.beginPath(); ctx.moveTo(px(car.x), py(car.y));
+      for (const n of car.path) { const [x, y] = xy(n); ctx.lineTo(px(x), py(y)); }
+      ctx.stroke(); ctx.setLineDash([]);
+      if (car.task && car.task.stage === 'drop') {
+        const [x, y] = xy(car.task.call.to);
+        ctx.font = `${cell * 0.4}px serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('🏁', px(x), py(y) - cell * 0.15);
+      }
+    }
+    // вызовы
+    for (const call of G.calls) {
+      if (call.state === 'ride') continue;
+      const [x, y] = xy(call.from), cx = px(x), cy = py(y);
+      const left = 1 - (G.t - call.born) / PATIENCE;
+      const r = cell * 0.3;
+      if (call === selected) {
+        const [tx, ty] = xy(call.to);
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.setLineDash([4 * dpr, 6 * dpr]); ctx.lineWidth = 2 * dpr;
+        ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(px(tx), py(ty)); ctx.stroke(); ctx.setLineDash([]);
+        ctx.font = `${cell * 0.4}px serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('🏁', px(tx), py(ty) - cell * 0.15);
+        ctx.fillStyle = 'rgba(255,210,63,.18)'; ctx.beginPath(); ctx.arc(cx, cy, r * 1.7 + Math.sin(now / 150) * 3, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = '#0b0d1a'; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = left > 0.5 ? '#5ef2a0' : left > 0.25 ? '#ffd23f' : '#ff5a6e'; ctx.lineWidth = cell * 0.07;
+      ctx.beginPath(); ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * left); ctx.stroke();
+      ctx.font = `${cell * 0.34}px serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(call.state === 'assigned' ? '⏳' : call.who, cx, cy + 1);
+    }
+    // машины
+    for (const car of G.cars) {
+      const cx = px(car.x), cy = py(car.y), r = cell * 0.27;
+      const free = !car.task || car.task.stage !== 'drop';
+      ctx.fillStyle = car.color; ctx.shadowColor = car.color; ctx.shadowBlur = selected && free ? 22 : 8;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0;
+      ctx.font = `${cell * 0.3}px serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(car.task && car.task.stage === 'drop' ? car.task.call.who : '🚕', cx, cy + 1);
+      if (selected) {
+        const label = free ? `${eta(car, selected)} с` : 'занят';
+        ctx.font = `800 ${Math.max(11 * dpr, cell * 0.22)}px JetBrains Mono, monospace`;
+        const w = ctx.measureText(label).width + 12 * dpr;
+        ctx.fillStyle = free ? '#ffd23f' : '#333a66'; ctx.beginPath(); ctx.roundRect(cx - w / 2, cy - r - cell * 0.42, w, cell * 0.32, 6 * dpr); ctx.fill();
+        ctx.fillStyle = free ? '#1b1600' : '#8c93c4'; ctx.fillText(label, cx, cy - r - cell * 0.26);
+      }
+    }
+    for (const f of floats) {
+      ctx.globalAlpha = 1 - f.t / 1.8; ctx.fillStyle = f.color;
+      ctx.font = `800 ${Math.max(13 * dpr, cell * 0.26)}px Onest, sans-serif`; ctx.textAlign = 'center';
+      ctx.fillText(f.text, px(f.x), py(f.y) - cell * 0.5 - f.t * cell * 0.4);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (running) update(dt);
+    draw(now);
+  }
+  requestAnimationFrame(loop);
+
+  function panel() {
+    const p = $('panel');
+    if (!G || !running) { p.innerHTML = '<p>Нажмите на вызов 🙋, затем на машину.</p>'; return; }
+    if (selected) {
+      const free = G.cars.filter((c) => !c.task || c.task.stage !== 'drop');
+      const bestCar = free.sort((a, b) => eta(a, selected) - eta(b, selected))[0];
+      p.innerHTML = `<p><b>${selected.who} Вызов · ${fmt(selected.fare)}</b><br>Выберите машину на карте</p>
+        ${bestCar ? `<button id="auto">Ближайшая · ${eta(bestCar, selected)} с</button>` : ''}<button class="ghost" id="cancel">✕</button>`;
+      if (bestCar) $('auto').onclick = () => assign(selected, bestCar);
+      $('cancel').onclick = () => { selected = null; panel(); };
+    } else {
+      const waiting = G.calls.filter((c) => c.state === 'wait').length;
+      p.innerHTML = `<p>${waiting ? `<b>Ждут машину: ${waiting}</b><br>Нажмите на клиента, затем на машину` : 'Пока тихо. Красный пунктир — пробки, там машины едут втрое медленнее.'}</p>`;
+    }
+  }
+
+  cv.addEventListener('pointerdown', (e) => {
+    if (!running) return;
+    const r = cv.getBoundingClientRect();
+    const mx = (e.clientX - r.left) * dpr, my = (e.clientY - r.top) * dpr;
+    const hit = (gx, gy) => Math.hypot(px(gx) - mx, py(gy) - my) < cell * 0.45;
+    if (selected) {
+      const car = G.cars.find((c) => hit(c.x, c.y));
+      if (car) { if (!car.task || car.task.stage !== 'drop') assign(selected, car); return; }
+    }
+    const call = G.calls.find((c) => c.state !== 'ride' && hit(...xy(c.from)));
+    selected = call || null;
+    panel();
+  });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape') { selected = null; panel(); } if (e.key === 'Enter' && !$('ov').hidden) $('card').querySelector('.go')?.click(); });
+
+  function end(survived) {
+    running = false; selected = null; panel();
+    const record = survived && G.money > best;
+    if (record) { best = G.money; try { localStorage.setItem('dispatch-best', best); } catch {} }
+    show(`<h1>${survived ? 'Смена <span>окончена</span>' : 'Вас <span>уволили</span>'}</h1>
+      <p>${survived ? 'Шесть утра, город просыпается. Неплохая ночь!' : 'Рейтинг упал ниже 2,5 звёзд — слишком много клиентов не дождались машину.'}</p>
+      <div class="stats"><div><b>${fmt(G.money)}</b>выручка</div><div><b>${G.served}</b>поездок</div><div><b>${G.lost}</b>потеряно</div></div>
+      <p>${record ? '🏆 Новый рекорд!' : best ? `Рекорд: ${fmt(best)}` : ''}</p>
+      <button class="go">Новая смена</button><br><a class="back" href="/">← Портфолио</a>`);
+  }
+  function show(html) { $('card').innerHTML = html; $('ov').hidden = false; $('card').querySelector('.go').onclick = newGame; }
+
+  layout();
+  show(`<h1>Ночной <span>диспетчер</span></h1>
+    <p>Ночная смена в службе такси, с 22:00 до 6:00. Город не спит, а машин всего три.</p>
+    <ul>
+      <li><span>🙋</span>Нажмите на клиента, потом на машину. Над машинами видно, за сколько секунд они доедут.</li>
+      <li><span>⏱️</span>Кольцо вокруг клиента — его терпение. Приедете быстро — получите чаевые 🤑.</li>
+      <li><span>🚧</span>Красный пунктир — пробки, через них машины едут втрое медленнее. Пробки меняются.</li>
+      <li><span>⭐</span>Каждый ушедший клиент снимает ползвезды. Рейтинг ниже 2,5 — увольнение.</li>
+      <li><span>🍸</span>Около двух ночи закрываются бары: готовьтесь к наплыву.</li>
+    </ul>
+    <button class="go">Начать смену</button>${best ? `<p>Рекорд: ${fmt(best)}</p>` : ''}<a class="back" href="/">← Портфолио</a>`);
+})();
+</script>
+</body>
+</html>
